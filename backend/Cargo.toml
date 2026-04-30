@@ -14,8 +14,8 @@ worker = ["dep:worker", "dep:worker-macros"]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4", "js"] }
-worker = { version = "0.5", features = ["d1"], optional = true }
-worker-macros = { version = "0.5", optional = true }
+worker = { version = "0.8", features = ["d1"], optional = true }
+worker-macros = { version = "0.8", optional = true }
 
 [profile.release]
 opt-level = "s"
