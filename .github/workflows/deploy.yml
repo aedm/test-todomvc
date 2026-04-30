@@ -1,0 +1,442 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main, claude/**]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            backend/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('backend/Cargo.toml') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Backend unit tests
+        working-directory: backend
+        run: cargo test --no-default-features --locked || cargo test --no-default-features
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend deps
+        working-directory: frontend
+        run: npm ci || npm install
+
+      - name: Frontend tests
+        working-directory: frontend
+        run: npm test
+
+      - name: Frontend build
+        working-directory: frontend
+        run: npm run build
+
+      - name: Upload frontend dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist
+          retention-days: 1
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy-test-todomvc
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify Cloudflare secrets are present and probe token
+        env:
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -o pipefail
+          mkdir -p /tmp/diag
+          {
+            if [ -z "$CF_TOKEN" ]; then
+              echo "::error::CLOUDFLARE_API_TOKEN secret is missing. Run the cloudflare-deploy mint workflow first." >&2
+              exit 1
+            fi
+            if [ -z "$CF_ACCOUNT" ]; then
+              echo "::error::CLOUDFLARE_ACCOUNT_ID secret is missing." >&2
+              exit 1
+            fi
+            cleaned=$(printf '%s' "$CF_TOKEN" | tr -d '\r\n\t ')
+            echo "::add-mask::$cleaned"
+            echo "CLOUDFLARE_API_TOKEN=$cleaned" >> "$GITHUB_ENV"
+
+            # Token-shape diagnostics. We don't print the token itself; only
+            # byte counts so we can see if it has non-token characters.
+            orig_len=${#CF_TOKEN}
+            clean_len=${#cleaned}
+            printable_len=$(printf '%s' "$cleaned" | tr -cd '[:print:]' | wc -c)
+            valid_len=$(printf '%s' "$cleaned" | tr -cd 'A-Za-z0-9_-' | wc -c)
+            echo "token byte counts: orig=$orig_len cleaned=$clean_len printable=$printable_len valid_charset=$valid_len"
+            if [ "$valid_len" -lt "$clean_len" ]; then
+              echo "::warning::Token contains characters outside [A-Za-z0-9_-]; unusual."
+            fi
+
+            account_len=${#CF_ACCOUNT}
+            account_valid=$(printf '%s' "$CF_ACCOUNT" | tr -cd '0-9a-f' | wc -c)
+            echo "account id byte counts: total=$account_len hex_chars=$account_valid"
+
+            # Probe the token directly so we know whether wrangler will work.
+            # Account-owned (cfat_*) tokens are rejected by /user/tokens/verify
+            # ('Invalid API Token') even when fully valid, so verify against
+            # the account endpoint instead.
+            code=$(curl -sS -o /tmp/diag/verify.json -w "%{http_code}" \
+              -H "Authorization: Bearer $cleaned" \
+              -H "Accept: application/json" \
+              "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT")
+            echo "verify (account) HTTP: $code"
+            jq -c '{success, errors, result: (.result // {} | {id, name})}' /tmp/diag/verify.json 2>/dev/null \
+              || cat /tmp/diag/verify.json
+            if [ "$code" -lt 200 ] || [ "$code" -ge 300 ]; then
+              echo "::error::CLOUDFLARE_API_TOKEN failed /accounts/{id} (HTTP $code). Re-run the cloudflare-deploy bootstrap mint workflow." >&2
+              exit 1
+            fi
+          } 2>&1 | tee /tmp/diag/verify.log
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install wrangler
+        run: npm install -g wrangler@4
+
+      - name: Add wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Cache cargo + worker-build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/worker-build
+            ~/.cargo/bin/wasm-bindgen
+            backend/target
+          key: deploy-cargo-v2-${{ runner.os }}-${{ hashFiles('backend/Cargo.lock') }}
+          restore-keys: deploy-cargo-v2-${{ runner.os }}-
+
+      - name: Install worker-build and wasm-bindgen-cli
+        run: |
+          set -euo pipefail
+          # wasm-bindgen-cli must exactly match the wasm-bindgen library version
+          # in Cargo.lock; otherwise the post-build step fails.
+          wbg_ver=$(grep -A1 '^name = "wasm-bindgen"$' backend/Cargo.lock | grep '^version' | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "wasm-bindgen lock version: $wbg_ver"
+          if ! wasm-bindgen --version 2>/dev/null | grep -q "$wbg_ver"; then
+            cargo install -q --locked wasm-bindgen-cli --version "$wbg_ver" --force
+          fi
+          if ! command -v worker-build >/dev/null 2>&1; then
+            cargo install -q --locked worker-build
+          fi
+          worker-build --version || true
+          wasm-bindgen --version
+
+      - name: Download frontend dist
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist
+
+      - name: Build worker WASM
+        id: build_worker
+        working-directory: backend
+        run: |
+          set -o pipefail
+          mkdir -p /tmp/diag
+          worker-build --release --features worker 2>&1 | tee /tmp/diag/build_worker.log
+
+      - name: Ensure workers.dev subdomain is registered for the account
+        id: subdomain
+        env:
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -o pipefail
+          mkdir -p /tmp/diag
+          {
+            set -euo pipefail
+            base="https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT}/workers/subdomain"
+            code=$(curl -sS -o /tmp/sub.json -w "%{http_code}" \
+              -H "Authorization: Bearer ${CF_TOKEN}" \
+              -H "Accept: application/json" \
+              "${base}")
+            echo "GET subdomain HTTP=$code"
+            cur=$(jq -r '.result.subdomain // empty' /tmp/sub.json 2>/dev/null || true)
+            if [ -n "$cur" ] && [ "$cur" != "null" ]; then
+              echo "subdomain already registered: ${cur}.workers.dev"
+              echo "subdomain=${cur}" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            # Pick a subdomain. Globally unique within Cloudflare. Try a sensible
+            # default first; if that 409s, fall back to a deterministic hash.
+            tried=()
+            for cand in aedm aedm-cf "aedm-${CF_ACCOUNT:0:6}"; do
+              tried+=("$cand")
+              put_code=$(curl -sS -o /tmp/sub-put.json -w "%{http_code}" -X PUT \
+                -H "Authorization: Bearer ${CF_TOKEN}" \
+                -H "Content-Type: application/json" \
+                -H "Accept: application/json" \
+                -d "{\"subdomain\":\"${cand}\"}" \
+                "${base}")
+              echo "PUT subdomain=${cand} HTTP=$put_code"
+              jq -c '{success, errors, result: (.result // {} | {subdomain})}' /tmp/sub-put.json 2>/dev/null || cat /tmp/sub-put.json
+              if [ "$put_code" -ge 200 ] && [ "$put_code" -lt 300 ]; then
+                ok=$(jq -r '.success // false' /tmp/sub-put.json)
+                if [ "$ok" = "true" ]; then
+                  echo "registered subdomain: ${cand}.workers.dev"
+                  echo "subdomain=${cand}" >> "$GITHUB_OUTPUT"
+                  exit 0
+                fi
+              fi
+              # Common failure: subdomain taken globally. Try the next candidate.
+              taken=$(jq -r '.errors[]? | select(.code==10038 or .code==10037) | .code' /tmp/sub-put.json 2>/dev/null | head -n1)
+              if [ -n "$taken" ]; then
+                echo "subdomain ${cand} unavailable (code $taken), trying next"
+                continue
+              fi
+              # Other error: stop and surface it.
+              echo "::error::PUT subdomain failed (HTTP $put_code) with non-conflict error"
+              exit 1
+            done
+            echo "::error::Could not register a workers.dev subdomain. Tried: ${tried[*]}"
+            exit 1
+          } 2>&1 | tee /tmp/diag/subdomain.log
+
+      - name: Ensure D1 database exists and capture id
+        id: d1
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -o pipefail
+          mkdir -p /tmp/diag
+          {
+            set -euxo pipefail
+            wrangler --version
+            db_name="test-todomvc-db"
+            # `wrangler d1 list` accepts --json; `d1 create` does not (in v4.x).
+            list_json=$(wrangler d1 list --json 2>&1 || echo '[]')
+            echo "list_json: $list_json"
+            db_id=$(echo "$list_json" | jq -r --arg n "$db_name" '.[] | select(.name==$n) | .uuid // .id' | head -n1)
+            if [ -z "$db_id" ] || [ "$db_id" = "null" ]; then
+              echo "Creating D1 database $db_name"
+              create_out=$(wrangler d1 create "$db_name" 2>&1)
+              echo "create_out: $create_out"
+              # Output contains a TOML snippet with database_id = "uuid"; extract it.
+              db_id=$(echo "$create_out" | grep -oE 'database_id\s*=\s*"[a-f0-9-]+"' | head -n1 \
+                | sed -E 's/.*"([a-f0-9-]+)".*/\1/')
+              if [ -z "$db_id" ]; then
+                # Fall back to a re-list in case the output format changed.
+                relist=$(wrangler d1 list --json 2>&1 || echo '[]')
+                db_id=$(echo "$relist" | jq -r --arg n "$db_name" '.[] | select(.name==$n) | .uuid // .id' | head -n1)
+              fi
+            fi
+            if [ -z "$db_id" ] || [ "$db_id" = "null" ]; then
+              echo "::error::Could not determine D1 database id"
+              exit 1
+            fi
+            echo "Resolved D1 database id: $db_id"
+            echo "db_id=$db_id" >> "$GITHUB_OUTPUT"
+          } 2>&1 | tee /tmp/diag/d1.log
+
+      - name: Patch wrangler.toml with database id
+        id: patch
+        env:
+          DB_ID: ${{ steps.d1.outputs.db_id }}
+        run: |
+          set -o pipefail
+          mkdir -p /tmp/diag
+          {
+            set -euxo pipefail
+            sed -i "s/PLACEHOLDER_DB_ID/${DB_ID}/" wrangler.toml
+            echo "--- wrangler.toml ---"
+            cat wrangler.toml
+          } 2>&1 | tee /tmp/diag/patch.log
+
+      - name: Apply D1 migrations (remote)
+        id: migrate
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -o pipefail
+          mkdir -p /tmp/diag
+          wrangler d1 execute test-todomvc-db --remote --file=migrations/0001_init.sql --yes 2>&1 | tee /tmp/diag/migrate.log
+
+      - name: Deploy worker
+        id: deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -o pipefail
+          mkdir -p /tmp/diag
+          {
+            set -euxo pipefail
+            wrangler deploy 2>&1
+          } | tee /tmp/diag/deploy.log
+          # Extract the worker URL from the captured log.
+          url=$(grep -oE 'https://[a-zA-Z0-9._-]+\.workers\.dev' /tmp/diag/deploy.log | head -n1 || true)
+          echo "Extracted URL: $url"
+          if [ -z "$url" ]; then
+            echo "::error::Could not extract workers.dev URL from wrangler output" >&2
+            exit 1
+          fi
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test deployed worker
+        id: smoke
+        env:
+          URL: ${{ steps.deploy.outputs.url }}
+        run: |
+          set -o pipefail
+          mkdir -p /tmp/diag
+          {
+            set -euo pipefail
+            echo "Probing $URL"
+            # Fresh workers.dev subdomains take a few minutes for the wildcard
+            # TLS cert to propagate; retry generously, ignoring TLS handshake
+            # errors during the wait.
+            attempts=60
+            interval=10
+            code=000
+            for i in $(seq 1 $attempts); do
+              # Capture HTTP status separately from the curl exit code so
+              # transient network/TLS failures don't pollute the variable.
+              if curl_out=$(curl -sS -o /tmp/health.txt -w "%{http_code}" \
+                  --max-time 10 "$URL/api/health" 2>/tmp/curl.err); then
+                code="$curl_out"
+              else
+                code="000"
+              fi
+              if [ "$code" = "200" ]; then
+                echo "Health endpoint OK on attempt $i"
+                break
+              fi
+              echo "attempt $i/$attempts: HTTP $code"
+              [ -s /tmp/curl.err ] && head -c 200 /tmp/curl.err && echo
+              [ -s /tmp/health.txt ] && head -c 200 /tmp/health.txt && echo
+              sleep $interval
+            done
+            if [ "$code" != "200" ]; then
+              echo "::error::Health endpoint never returned 200 after $((attempts*interval))s (last code: $code). Possible: wildcard TLS cert for new workers.dev subdomain still propagating."
+              exit 1
+            fi
+
+            # Round-trip: create, list, update, delete.
+            create_resp=$(curl -sS -o /tmp/create.json -w "%{http_code}" \
+              -X POST "$URL/api/todos" \
+              -H 'content-type: application/json' \
+              -d '{"title":"smoke test"}')
+            cat /tmp/create.json
+            [ "$create_resp" = "201" ]
+            id=$(jq -r '.id' /tmp/create.json)
+            [ -n "$id" ] && [ "$id" != "null" ]
+            echo "created todo id=$id"
+
+            list_resp=$(curl -sS "$URL/api/todos")
+            echo "$list_resp"
+            echo "$list_resp" | jq -e --arg id "$id" '.[] | select(.id==$id and .title=="smoke test")' >/dev/null
+
+            patch_resp=$(curl -sS -o /tmp/patch.json -w "%{http_code}" \
+              -X PATCH "$URL/api/todos/$id" \
+              -H 'content-type: application/json' \
+              -d '{"completed":true}')
+            cat /tmp/patch.json
+            [ "$patch_resp" = "200" ]
+            jq -e '.completed == true' /tmp/patch.json >/dev/null
+
+            del_resp=$(curl -sS -o /tmp/del.txt -w "%{http_code}" \
+              -X DELETE "$URL/api/todos/$id")
+            cat /tmp/del.txt || true
+            [ "$del_resp" = "204" ]
+
+            home_code=$(curl -sS -o /tmp/home.html -w "%{http_code}" "$URL/")
+            [ "$home_code" = "200" ]
+            grep -q '<div id="root">' /tmp/home.html
+
+            echo "All smoke tests passed."
+          } 2>&1 | tee /tmp/diag/smoke.log
+
+      - name: Post failure log
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          mkdir -p /tmp/diag
+          # Pick the most recently modified diag log (= the failed step).
+          latest=$(ls -t /tmp/diag/*.log 2>/dev/null | head -n1)
+          if [ -z "$latest" ]; then
+            echo "No diag logs to post" >&2
+            exit 0
+          fi
+          step=$(basename "$latest" .log)
+          tail -c 50000 "$latest" > /tmp/tail.log
+          echo "----- $step (tail) -----"
+          cat /tmp/tail.log
+
+          branch="${GITHUB_REF_NAME:-}"
+          pr=$(curl -sS \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls?head=${{ github.repository_owner }}:${branch}&state=open" \
+            | jq -r '.[0].number // empty')
+          [ -n "$pr" ] || pr=1
+          body=$(jq -Rs --arg sha "${GITHUB_SHA:0:7}" --arg step "$step" '"### " + $step + " failure on `" + $sha + "` (tail)\n\n```\n" + . + "\n```"' < /tmp/tail.log)
+          curl -sS -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/issues/$pr/comments" \
+            -d "{\"body\": $body}" || true
+
+          del_resp=$(curl -sS -o /tmp/del.txt -w "%{http_code}" \
+            -X DELETE "$URL/api/todos/$id")
+          [ "$del_resp" = "204" ] || { echo "delete failed: HTTP $del_resp"; cat /tmp/del.txt; exit 1; }
+
+          # Confirm static asset (index.html) serves
+          home_code=$(curl -sS -o /tmp/home.html -w "%{http_code}" "$URL/")
+          [ "$home_code" = "200" ] || { echo "home failed: HTTP $home_code"; exit 1; }
+          grep -q '<div id="root">' /tmp/home.html || { echo "home page missing root div"; head -c 500 /tmp/home.html; exit 1; }
+
+          echo "All smoke tests passed."
+
+      - name: Summary
+        env:
+          URL: ${{ steps.deploy.outputs.url }}
+          DB_ID: ${{ steps.d1.outputs.db_id }}
+        run: |
+          {
+            echo "## Deploy complete"
+            echo ""
+            echo "- Worker URL: $URL"
+            echo "- D1 database id: \`$DB_ID\`"
+          } >> "$GITHUB_STEP_SUMMARY"
