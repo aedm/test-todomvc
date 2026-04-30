@@ -320,21 +320,34 @@ jobs:
           set -o pipefail
           mkdir -p /tmp/diag
           {
-            set -euxo pipefail
+            set -euo pipefail
             echo "Probing $URL"
-            for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
-              code=$(curl -sS -o /tmp/health.txt -w "%{http_code}" "$URL/api/health" || echo "000")
+            # Fresh workers.dev subdomains take a few minutes for the wildcard
+            # TLS cert to propagate; retry generously, ignoring TLS handshake
+            # errors during the wait.
+            attempts=60
+            interval=10
+            code=000
+            for i in $(seq 1 $attempts); do
+              # Capture HTTP status separately from the curl exit code so
+              # transient network/TLS failures don't pollute the variable.
+              if curl_out=$(curl -sS -o /tmp/health.txt -w "%{http_code}" \
+                  --max-time 10 "$URL/api/health" 2>/tmp/curl.err); then
+                code="$curl_out"
+              else
+                code="000"
+              fi
               if [ "$code" = "200" ]; then
-                echo "Health endpoint OK"
+                echo "Health endpoint OK on attempt $i"
                 break
               fi
-              echo "attempt $i: HTTP $code"
-              cat /tmp/health.txt || true
-              echo
-              sleep 5
+              echo "attempt $i/$attempts: HTTP $code"
+              [ -s /tmp/curl.err ] && head -c 200 /tmp/curl.err && echo
+              [ -s /tmp/health.txt ] && head -c 200 /tmp/health.txt && echo
+              sleep $interval
             done
             if [ "$code" != "200" ]; then
-              echo "::error::Health endpoint never returned 200 (last code: $code)"
+              echo "::error::Health endpoint never returned 200 after $((attempts*interval))s (last code: $code). Possible: wildcard TLS cert for new workers.dev subdomain still propagating."
               exit 1
             fi
 
