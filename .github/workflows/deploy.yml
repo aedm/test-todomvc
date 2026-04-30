@@ -65,11 +65,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Verify Cloudflare secrets are present
+      - name: Verify Cloudflare secrets are present and probe token
         env:
           CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
+          set -o pipefail
+          mkdir -p /tmp/diag
           if [ -z "$CF_TOKEN" ]; then
             echo "::error::CLOUDFLARE_API_TOKEN secret is missing. Run the cloudflare-deploy mint workflow first." >&2
             exit 1
@@ -78,6 +80,31 @@ jobs:
             echo "::error::CLOUDFLARE_ACCOUNT_ID secret is missing." >&2
             exit 1
           fi
+          # Strip any leading/trailing whitespace or CR/LF that may have been
+          # captured when the secret was minted/written. Re-export the cleaned
+          # token for downstream steps so wrangler doesn't get a malformed
+          # Authorization header.
+          cleaned=$(printf '%s' "$CF_TOKEN" | tr -d '\r\n\t ')
+          echo "::add-mask::$cleaned"
+          echo "CLOUDFLARE_API_TOKEN=$cleaned" >> "$GITHUB_ENV"
+          orig_len=${#CF_TOKEN}
+          clean_len=${#cleaned}
+          echo "token length: original=$orig_len, cleaned=$clean_len"
+
+          # Probe the token directly so we know whether wrangler will work.
+          {
+            code=$(curl -sS -o /tmp/diag/verify.json -w "%{http_code}" \
+              -H "Authorization: Bearer $cleaned" \
+              -H "Accept: application/json" \
+              "https://api.cloudflare.com/client/v4/user/tokens/verify")
+            echo "verify HTTP: $code"
+            jq -c '{success, errors, result: (.result // {} | {id, status})}' /tmp/diag/verify.json 2>/dev/null \
+              || cat /tmp/diag/verify.json
+            if [ "$code" -lt 200 ] || [ "$code" -ge 300 ]; then
+              echo "::error::CLOUDFLARE_API_TOKEN failed /user/tokens/verify (HTTP $code). The token may be missing, malformed, revoked, or lacking permissions. Re-run the cloudflare-deploy bootstrap mint workflow." >&2
+              exit 1
+            fi
+          } 2>&1 | tee /tmp/diag/verify.log
 
       - name: Use Node.js 22
         uses: actions/setup-node@v4
