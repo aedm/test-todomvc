@@ -101,15 +101,18 @@ jobs:
             echo "account id byte counts: total=$account_len hex_chars=$account_valid"
 
             # Probe the token directly so we know whether wrangler will work.
+            # Account-owned (cfat_*) tokens are rejected by /user/tokens/verify
+            # ('Invalid API Token') even when fully valid, so verify against
+            # the account endpoint instead.
             code=$(curl -sS -o /tmp/diag/verify.json -w "%{http_code}" \
               -H "Authorization: Bearer $cleaned" \
               -H "Accept: application/json" \
-              "https://api.cloudflare.com/client/v4/user/tokens/verify")
-            echo "verify HTTP: $code"
-            jq -c '{success, errors, result: (.result // {} | {id, status})}' /tmp/diag/verify.json 2>/dev/null \
+              "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT")
+            echo "verify (account) HTTP: $code"
+            jq -c '{success, errors, result: (.result // {} | {id, name})}' /tmp/diag/verify.json 2>/dev/null \
               || cat /tmp/diag/verify.json
             if [ "$code" -lt 200 ] || [ "$code" -ge 300 ]; then
-              echo "::error::CLOUDFLARE_API_TOKEN failed /user/tokens/verify (HTTP $code). The token in this repo's secrets is malformed/revoked. Re-run the cloudflare-deploy bootstrap mint workflow." >&2
+              echo "::error::CLOUDFLARE_API_TOKEN failed /accounts/{id} (HTTP $code). Re-run the cloudflare-deploy bootstrap mint workflow." >&2
               exit 1
             fi
           } 2>&1 | tee /tmp/diag/verify.log
