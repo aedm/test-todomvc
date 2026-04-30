@@ -184,14 +184,22 @@ jobs:
             set -euxo pipefail
             wrangler --version
             db_name="test-todomvc-db"
+            # `wrangler d1 list` accepts --json; `d1 create` does not (in v4.x).
             list_json=$(wrangler d1 list --json 2>&1 || echo '[]')
             echo "list_json: $list_json"
             db_id=$(echo "$list_json" | jq -r --arg n "$db_name" '.[] | select(.name==$n) | .uuid // .id' | head -n1)
             if [ -z "$db_id" ] || [ "$db_id" = "null" ]; then
               echo "Creating D1 database $db_name"
-              create_out=$(wrangler d1 create "$db_name" --json 2>&1)
+              create_out=$(wrangler d1 create "$db_name" 2>&1)
               echo "create_out: $create_out"
-              db_id=$(echo "$create_out" | jq -r '.uuid // .id // .result.uuid // .result.id')
+              # Output contains a TOML snippet with database_id = "uuid"; extract it.
+              db_id=$(echo "$create_out" | grep -oE 'database_id\s*=\s*"[a-f0-9-]+"' | head -n1 \
+                | sed -E 's/.*"([a-f0-9-]+)".*/\1/')
+              if [ -z "$db_id" ]; then
+                # Fall back to a re-list in case the output format changed.
+                relist=$(wrangler d1 list --json 2>&1 || echo '[]')
+                db_id=$(echo "$relist" | jq -r --arg n "$db_name" '.[] | select(.name==$n) | .uuid // .id' | head -n1)
+              fi
             fi
             if [ -z "$db_id" ] || [ "$db_id" = "null" ]; then
               echo "::error::Could not determine D1 database id"
