@@ -1,0 +1,242 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main, claude/**]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            backend/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('backend/Cargo.toml') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Backend unit tests
+        working-directory: backend
+        run: cargo test --no-default-features --locked || cargo test --no-default-features
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend deps
+        working-directory: frontend
+        run: npm ci || npm install
+
+      - name: Frontend tests
+        working-directory: frontend
+        run: npm test
+
+      - name: Frontend build
+        working-directory: frontend
+        run: npm run build
+
+      - name: Upload frontend dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist
+          retention-days: 1
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy-test-todomvc
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify Cloudflare secrets are present
+        env:
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          if [ -z "$CF_TOKEN" ]; then
+            echo "::error::CLOUDFLARE_API_TOKEN secret is missing. Run the cloudflare-deploy mint workflow first." >&2
+            exit 1
+          fi
+          if [ -z "$CF_ACCOUNT" ]; then
+            echo "::error::CLOUDFLARE_ACCOUNT_ID secret is missing." >&2
+            exit 1
+          fi
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install wrangler
+        run: npm install -g wrangler@4
+
+      - name: Add wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Cache cargo + worker-build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/worker-build
+            backend/target
+          key: deploy-cargo-${{ runner.os }}-${{ hashFiles('backend/Cargo.toml') }}
+          restore-keys: deploy-cargo-${{ runner.os }}-
+
+      - name: Install worker-build
+        run: |
+          if ! command -v worker-build >/dev/null 2>&1; then
+            cargo install -q worker-build --version '^0.1'
+          fi
+
+      - name: Download frontend dist
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist
+
+      - name: Build worker WASM
+        working-directory: backend
+        run: worker-build --release -- --features worker
+
+      - name: Ensure D1 database exists and capture id
+        id: d1
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          db_name="test-todomvc-db"
+          # Check existing
+          list_json=$(wrangler d1 list --json 2>/dev/null || echo '[]')
+          db_id=$(echo "$list_json" | jq -r --arg n "$db_name" '.[] | select(.name==$n) | .uuid // .id' | head -n1)
+          if [ -z "$db_id" ] || [ "$db_id" = "null" ]; then
+            echo "Creating D1 database $db_name"
+            create_out=$(wrangler d1 create "$db_name" --json)
+            db_id=$(echo "$create_out" | jq -r '.uuid // .id // .result.uuid // .result.id')
+          fi
+          if [ -z "$db_id" ] || [ "$db_id" = "null" ]; then
+            echo "::error::Could not determine D1 database id" >&2
+            echo "list: $list_json" >&2
+            exit 1
+          fi
+          echo "Resolved D1 database id: $db_id"
+          echo "db_id=$db_id" >> "$GITHUB_OUTPUT"
+
+      - name: Patch wrangler.toml with database id
+        env:
+          DB_ID: ${{ steps.d1.outputs.db_id }}
+        run: |
+          set -euo pipefail
+          sed -i "s/PLACEHOLDER_DB_ID/${DB_ID}/" wrangler.toml
+          echo "--- wrangler.toml ---"
+          grep -E '^(name|main|database_id)' wrangler.toml || true
+
+      - name: Apply D1 migrations (remote)
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          # Apply unconditionally; CREATE TABLE IF NOT EXISTS makes it idempotent.
+          wrangler d1 execute test-todomvc-db --remote --file=migrations/0001_init.sql --yes
+
+      - name: Deploy worker
+        id: deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          out=$(wrangler deploy 2>&1 | tee /dev/stderr)
+          # Extract the worker URL from the output
+          url=$(echo "$out" | grep -oE 'https://[a-zA-Z0-9._-]+\.workers\.dev' | head -n1 || true)
+          if [ -z "$url" ]; then
+            url="https://test-todomvc.${CLOUDFLARE_ACCOUNT_ID}.workers.dev"
+          fi
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "Deployed at: $url"
+
+      - name: Smoke test deployed worker
+        env:
+          URL: ${{ steps.deploy.outputs.url }}
+        run: |
+          set -euo pipefail
+          echo "Probing $URL"
+          # Allow up to ~60s for the deploy to propagate.
+          for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+            code=$(curl -sS -o /tmp/health.txt -w "%{http_code}" "$URL/api/health" || echo "000")
+            if [ "$code" = "200" ]; then
+              echo "Health endpoint OK"
+              break
+            fi
+            echo "attempt $i: HTTP $code, retrying..."
+            sleep 5
+          done
+          if [ "$code" != "200" ]; then
+            echo "::error::Health endpoint never returned 200 (last code: $code)" >&2
+            cat /tmp/health.txt >&2 || true
+            exit 1
+          fi
+
+          # Round-trip: create, list, update, delete.
+          create_resp=$(curl -sS -o /tmp/create.json -w "%{http_code}" \
+            -X POST "$URL/api/todos" \
+            -H 'content-type: application/json' \
+            -d '{"title":"smoke test"}')
+          [ "$create_resp" = "201" ] || { echo "create failed: HTTP $create_resp"; cat /tmp/create.json; exit 1; }
+          id=$(jq -r '.id' /tmp/create.json)
+          [ -n "$id" ] && [ "$id" != "null" ] || { echo "no id"; exit 1; }
+          echo "created todo id=$id"
+
+          list_resp=$(curl -sS "$URL/api/todos")
+          echo "$list_resp" | jq -e --arg id "$id" '.[] | select(.id==$id and .title=="smoke test")' >/dev/null \
+            || { echo "todo not in list: $list_resp"; exit 1; }
+
+          patch_resp=$(curl -sS -o /tmp/patch.json -w "%{http_code}" \
+            -X PATCH "$URL/api/todos/$id" \
+            -H 'content-type: application/json' \
+            -d '{"completed":true}')
+          [ "$patch_resp" = "200" ] || { echo "patch failed: HTTP $patch_resp"; cat /tmp/patch.json; exit 1; }
+          jq -e '.completed == true' /tmp/patch.json >/dev/null || { echo "patch did not flip completed"; exit 1; }
+
+          del_resp=$(curl -sS -o /tmp/del.txt -w "%{http_code}" \
+            -X DELETE "$URL/api/todos/$id")
+          [ "$del_resp" = "204" ] || { echo "delete failed: HTTP $del_resp"; cat /tmp/del.txt; exit 1; }
+
+          # Confirm static asset (index.html) serves
+          home_code=$(curl -sS -o /tmp/home.html -w "%{http_code}" "$URL/")
+          [ "$home_code" = "200" ] || { echo "home failed: HTTP $home_code"; exit 1; }
+          grep -q '<div id="root">' /tmp/home.html || { echo "home page missing root div"; head -c 500 /tmp/home.html; exit 1; }
+
+          echo "All smoke tests passed."
+
+      - name: Summary
+        env:
+          URL: ${{ steps.deploy.outputs.url }}
+          DB_ID: ${{ steps.d1.outputs.db_id }}
+        run: |
+          {
+            echo "## Deploy complete"
+            echo ""
+            echo "- Worker URL: $URL"
+            echo "- D1 database id: \`$DB_ID\`"
+          } >> "$GITHUB_STEP_SUMMARY"
