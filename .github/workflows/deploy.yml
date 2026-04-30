@@ -97,15 +97,26 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             ~/.cargo/bin/worker-build
+            ~/.cargo/bin/wasm-bindgen
             backend/target
-          key: deploy-cargo-${{ runner.os }}-${{ hashFiles('backend/Cargo.toml') }}
-          restore-keys: deploy-cargo-${{ runner.os }}-
+          key: deploy-cargo-v2-${{ runner.os }}-${{ hashFiles('backend/Cargo.lock') }}
+          restore-keys: deploy-cargo-v2-${{ runner.os }}-
 
-      - name: Install worker-build
+      - name: Install worker-build and wasm-bindgen-cli
         run: |
-          if ! command -v worker-build >/dev/null 2>&1; then
-            cargo install -q worker-build --version '^0.1'
+          set -euo pipefail
+          # wasm-bindgen-cli must exactly match the wasm-bindgen library version
+          # in Cargo.lock; otherwise the post-build step fails.
+          wbg_ver=$(grep -A1 '^name = "wasm-bindgen"$' backend/Cargo.lock | grep '^version' | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "wasm-bindgen lock version: $wbg_ver"
+          if ! wasm-bindgen --version 2>/dev/null | grep -q "$wbg_ver"; then
+            cargo install -q --locked wasm-bindgen-cli --version "$wbg_ver" --force
           fi
+          if ! command -v worker-build >/dev/null 2>&1; then
+            cargo install -q --locked worker-build
+          fi
+          worker-build --version || true
+          wasm-bindgen --version
 
       - name: Download frontend dist
         uses: actions/download-artifact@v4
@@ -115,7 +126,7 @@ jobs:
 
       - name: Build worker WASM
         working-directory: backend
-        run: worker-build --release -- --features worker
+        run: worker-build --release --features worker
 
       - name: Ensure D1 database exists and capture id
         id: d1
