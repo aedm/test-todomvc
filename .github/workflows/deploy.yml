@@ -125,8 +125,35 @@ jobs:
           path: frontend/dist
 
       - name: Build worker WASM
+        id: build_worker
         working-directory: backend
-        run: worker-build --release --features worker
+        run: |
+          set -o pipefail
+          worker-build --release --features worker 2>&1 | tee /tmp/worker-build.log
+
+      - name: Post build log on failure
+        if: failure() && steps.build_worker.conclusion == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          # Find PR number for the current branch (push events don't carry it).
+          branch="${GITHUB_REF_NAME:-}"
+          pr=$(curl -sS \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls?head=${{ github.repository_owner }}:${branch}&state=open" \
+            | jq -r '.[0].number // empty')
+          [ -n "$pr" ] || pr=1
+          echo "Posting failure tail to PR #$pr"
+
+          tail -c 60000 /tmp/worker-build.log > /tmp/diag-tail.log
+          body=$(jq -Rs --arg sha "${GITHUB_SHA:0:7}" '"### worker-build failure on `" + $sha + "` (tail)\n\n```\n" + . + "\n```"' < /tmp/diag-tail.log)
+          curl -sS -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/issues/$pr/comments" \
+            -d "{\"body\": $body}" || true
 
       - name: Ensure D1 database exists and capture id
         id: d1
